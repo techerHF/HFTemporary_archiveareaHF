@@ -16,9 +16,15 @@ permissions:
   contents: read
 
 jobs:
-  validate-public-pages:
+  validate-city-pages:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        city_batch: [0, 1, 2, 3]
+    env:
+      CITY_BATCH_INDEX: ${{ matrix.city_batch }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,13 +32,13 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check requests beautifulsoup4 lxml
-      - name: Run KKday research batch B
-        run: python kkday_research/batch_b.py
-      - name: Upload research output
+      - name: Run city verification batch
+        run: python kkday_research/city_run.py
+      - name: Upload city research output
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kkday-research-output
+          name: kkday-city-batch-${{ matrix.city_batch }}
           path: kkday_research/output/
           if-no-files-found: error
           retention-days: 7
