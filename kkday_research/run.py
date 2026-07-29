@@ -21,30 +21,33 @@ OUTPUT = ROOT / "output"
 OUTPUT.mkdir(parents=True, exist_ok=True)
 
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.7",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "Cache-Control": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 CATEGORY_BASES = [
     "https://www.kkday.com/zh-tw/category/tw-taiwan/experiences/list",
     "https://www.kkday.com/zh-tw/category/jp-japan/experiences/list",
 ]
-PAGE_NUMBERS = [1, 2, 3]
-MAX_PRODUCT_CHECKS = 30
-REQUEST_TIMEOUT = 35
+REQUEST_TIMEOUT = 40
+MAX_PRODUCT_CHECKS = 25
+MAX_JS_FILES = 15
 
-PRODUCT_PATTERNS = [
-    re.compile(r"https?://www\.kkday\.com/zh-tw/product/(\d+)(?:[-/?#][^\"'<>\\ ]*)?", re.I),
-    re.compile(r"/zh-tw/product/(\d+)(?:[-/?#][^\"'<>\\ ]*)?", re.I),
-    re.compile(r"https?:\\/\\/www\.kkday\.com\\/zh-tw\\/product\\/(\d+)", re.I),
-    re.compile(r"\\/zh-tw\\/product\\/(\d+)", re.I),
-]
+PRODUCT_HREF_RE = re.compile(
+    r"(?:https?:)?(?:\\/\\/|//)?(?:www\\.)?kkday\\.com(?:\\/|/)(?:zh-tw|en)(?:\\/|/)product(?:\\/|/)(\d+)([^\"'<> ]*)",
+    re.I,
+)
+ENDPOINT_HINT_RE = re.compile(
+    r"[^\"'\\s]{0,160}(?:ajax_productlist|productlist|product-list|search/products|api/v\d+|page_size|pageSize|current_page|currentPage)[^\"'\\s]{0,220}",
+    re.I,
+)
 
 
 @dataclass
@@ -61,6 +64,7 @@ class FetchResult:
 @dataclass
 class ProductResult:
     product_id: str
+    source_listing_url: str
     requested_url: str
     status_code: int | None
     final_url: str
@@ -75,17 +79,21 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def page_url(base: str, page: int) -> str:
-    if page == 1:
-        return base
-    separator = "&" if "?" in base else "?"
-    return f"{base}{separator}page={page}"
-
-
-def fetch(session: requests.Session, url: str) -> tuple[FetchResult, str]:
+def fetch(
+    session: requests.Session,
+    url: str,
+    *,
+    referer: str | None = None,
+) -> tuple[FetchResult, str]:
+    headers = {"Referer": referer} if referer else None
     started = time.monotonic()
     try:
-        response = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        response = session.get(
+            url,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+        )
         elapsed = time.monotonic() - started
         text = response.text
         soup = BeautifulSoup(text, "lxml")
@@ -118,18 +126,55 @@ def fetch(session: requests.Session, url: str) -> tuple[FetchResult, str]:
         )
 
 
-def extract_product_ids(html: str) -> set[str]:
+def normalize_href(href: str, base_url: str) -> str:
+    href = unescape(href).replace("\\/", "/").strip()
+    if href.startswith("//"):
+        href = "https:" + href
+    return urljoin(base_url, href)
+
+
+def extract_product_links(html: str, base_url: str) -> dict[str, str]:
+    links: dict[str, str] = {}
     if not html:
-        return set()
-    candidates = {html, unescape(html), html.replace("\\/", "/")}
-    product_ids: set[str] = set()
-    for candidate in candidates:
-        for pattern in PRODUCT_PATTERNS:
-            product_ids.update(pattern.findall(candidate))
-    return product_ids
+        return links
+    soup = BeautifulSoup(html, "lxml")
+    for anchor in soup.select('a[href*="/product/"]'):
+        href = normalize_href(anchor.get("href", ""), base_url)
+        match = re.search(r"/(?:zh-tw|en)/product/(\d+)", urlparse(href).path, re.I)
+        if match:
+            links.setdefault(match.group(1), href)
+    decoded_variants = {html, unescape(html), html.replace("\\/", "/")}
+    for variant in decoded_variants:
+        for match in PRODUCT_HREF_RE.finditer(variant):
+            product_id = match.group(1)
+            raw = match.group(0).replace("\\/", "/")
+            if raw.startswith("//"):
+                raw = "https:" + raw
+            elif not raw.startswith("http"):
+                raw = "https://www.kkday.com/" + raw.lstrip("/")
+            links.setdefault(product_id, raw)
+    return links
 
 
-def valid_direct_product(product_id: str, result: FetchResult, html: str) -> ProductResult:
+def inspect_listing_html(html: str, base_url: str) -> tuple[list[str], list[str], list[str]]:
+    soup = BeautifulSoup(html, "lxml")
+    script_urls = [urljoin(base_url, tag.get("src")) for tag in soup.find_all("script", src=True)]
+    endpoint_hints = sorted({re.sub(r"\\/", "/", hit) for hit in ENDPOINT_HINT_RE.findall(html)})
+    category_links = sorted(
+        {
+            normalize_href(anchor.get("href", ""), base_url)
+            for anchor in soup.select('a[href*="/category/"][href*="/experiences/list"]')
+        }
+    )
+    return script_urls, endpoint_hints, category_links
+
+
+def valid_direct_product(
+    product_id: str,
+    source_listing_url: str,
+    result: FetchResult,
+    html: str,
+) -> ProductResult:
     failure: list[str] = []
     if result.status_code != 200:
         failure.append(f"HTTP_{result.status_code}")
@@ -143,18 +188,18 @@ def valid_direct_product(product_id: str, result: FetchResult, html: str) -> Pro
     if not normalized_title:
         failure.append("MISSING_TITLE")
     lowered = normalized_title.lower()
-    if "access denied" in lowered or "captcha" in lowered or "robot" in lowered:
+    if any(token in lowered for token in ("access denied", "captcha", "robot", "kkday.com")) and len(html) < 5000:
         failure.append("ANTI_BOT_PAGE")
     if len(html) < 5_000:
         failure.append("CONTENT_TOO_SHORT")
-    verified = not failure
     return ProductResult(
         product_id=product_id,
-        requested_url=f"https://www.kkday.com/zh-tw/product/{product_id}",
+        source_listing_url=source_listing_url,
+        requested_url=result.requested_url,
         status_code=result.status_code,
         final_url=result.final_url,
         page_title=normalized_title,
-        verified=verified,
+        verified=not failure,
         failure_reason="|".join(failure),
         content_length=result.content_length,
         checked_at=now_iso(),
@@ -172,83 +217,107 @@ def main() -> int:
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    listing_results: list[dict] = []
-    all_ids: set[str] = set()
+    listing_rows: list[dict] = []
+    all_product_links: dict[str, tuple[str, str]] = {}
+    all_script_urls: set[str] = set()
+    endpoint_hints: set[str] = set()
+    discovered_categories: set[str] = set()
 
     for base in CATEGORY_BASES:
-        previous_ids: set[str] | None = None
-        for page in PAGE_NUMBERS:
-            url = page_url(base, page)
-            fetched, html = fetch(session, url)
-            ids = extract_product_ids(html)
-            all_ids.update(ids)
-            listing_results.append(
-                {
-                    **asdict(fetched),
-                    "category_base": base,
-                    "page_number": page,
-                    "product_id_count": len(ids),
-                    "product_ids": ",".join(sorted(ids, key=int)),
-                    "same_as_previous_page": previous_ids == ids if previous_ids is not None else False,
-                }
-            )
-            previous_ids = ids
-            time.sleep(random.uniform(0.45, 0.9))
+        fetched, html = fetch(session, base)
+        links = extract_product_links(html, base)
+        scripts, hints, categories = inspect_listing_html(html, base)
+        all_script_urls.update(scripts)
+        endpoint_hints.update(hints)
+        discovered_categories.update(categories)
+        for product_id, product_url in links.items():
+            all_product_links.setdefault(product_id, (product_url, base))
+        listing_rows.append(
+            {
+                **asdict(fetched),
+                "category_base": base,
+                "product_link_count": len(links),
+                "product_links": json.dumps(links, ensure_ascii=False, sort_keys=True),
+                "script_count": len(scripts),
+                "endpoint_hint_count": len(hints),
+                "discovered_category_count": len(categories),
+            }
+        )
+        time.sleep(random.uniform(0.6, 1.1))
 
-    product_results: list[dict] = []
-    for product_id in sorted(all_ids, key=int)[:MAX_PRODUCT_CHECKS]:
-        product_url = f"https://www.kkday.com/zh-tw/product/{product_id}"
-        fetched, html = fetch(session, product_url)
-        product_results.append(asdict(valid_direct_product(product_id, fetched, html)))
-        time.sleep(random.uniform(0.35, 0.75))
+    js_rows: list[dict] = []
+    for script_url in sorted(all_script_urls)[:MAX_JS_FILES]:
+        fetched, js_text = fetch(session, script_url, referer=CATEGORY_BASES[0])
+        hints = sorted({re.sub(r"\\/", "/", hit) for hit in ENDPOINT_HINT_RE.findall(js_text)})
+        endpoint_hints.update(hints)
+        js_rows.append(
+            {
+                **asdict(fetched),
+                "endpoint_hint_count": len(hints),
+                "endpoint_hints": json.dumps(hints[:100], ensure_ascii=False),
+            }
+        )
+        time.sleep(random.uniform(0.2, 0.45))
 
-    verified_count = sum(1 for row in product_results if row["verified"])
-    repeated_pages = sum(1 for row in listing_results if row["same_as_previous_page"])
+    product_rows: list[dict] = []
+    for product_id, (product_url, source_listing_url) in list(sorted(all_product_links.items(), key=lambda item: int(item[0])))[:MAX_PRODUCT_CHECKS]:
+        fetched, html = fetch(session, product_url, referer=source_listing_url)
+        product_rows.append(
+            asdict(valid_direct_product(product_id, source_listing_url, fetched, html))
+        )
+        time.sleep(random.uniform(0.45, 0.8))
+
+    verified_count = sum(1 for row in product_rows if row["verified"])
+    status_counts: dict[str, int] = {}
+    for row in product_rows:
+        key = str(row["status_code"])
+        status_counts[key] = status_counts.get(key, 0) + 1
+
     summary = {
-        "mode": "diagnostic",
-        "started_and_finished_at": now_iso(),
-        "category_bases": CATEGORY_BASES,
-        "pages_attempted": len(listing_results),
-        "unique_candidate_product_ids": len(all_ids),
-        "products_checked": len(product_results),
+        "mode": "diagnostic_v2_slug_and_endpoint_discovery",
+        "finished_at": now_iso(),
+        "listing_pages": len(listing_rows),
+        "unique_candidate_product_ids": len(all_product_links),
+        "full_slug_urls_found": sum(1 for url, _ in all_product_links.values() if re.search(r"/product/\d+-", urlparse(url).path)),
+        "discovered_country_or_category_urls": len(discovered_categories),
+        "script_urls_found": len(all_script_urls),
+        "endpoint_hints_found": len(endpoint_hints),
+        "products_checked": len(product_rows),
         "products_verified": verified_count,
-        "products_failed": len(product_results) - verified_count,
-        "listing_pages_repeated_from_previous": repeated_pages,
-        "diagnostic_passed": len(all_ids) >= 10 and verified_count >= 5,
+        "product_status_counts": status_counts,
+        "diagnostic_passed": len(all_product_links) >= 10 and verified_count >= 5,
     }
 
     write_csv(
         OUTPUT / "listing_pages.csv",
-        listing_results,
+        listing_rows,
         [
-            "category_base",
-            "page_number",
-            "requested_url",
-            "status_code",
-            "final_url",
-            "title",
-            "content_length",
-            "elapsed_seconds",
-            "error",
-            "product_id_count",
-            "product_ids",
-            "same_as_previous_page",
+            "category_base", "requested_url", "status_code", "final_url", "title",
+            "content_length", "elapsed_seconds", "error", "product_link_count",
+            "product_links", "script_count", "endpoint_hint_count", "discovered_category_count",
         ],
     )
     write_csv(
         OUTPUT / "products_checked.csv",
-        product_results,
+        product_rows,
         [
-            "product_id",
-            "requested_url",
-            "status_code",
-            "final_url",
-            "page_title",
-            "verified",
-            "failure_reason",
-            "content_length",
-            "checked_at",
+            "product_id", "source_listing_url", "requested_url", "status_code", "final_url",
+            "page_title", "verified", "failure_reason", "content_length", "checked_at",
         ],
+    )
+    write_csv(
+        OUTPUT / "javascript_inspection.csv",
+        js_rows,
+        [
+            "requested_url", "status_code", "final_url", "title", "content_length",
+            "elapsed_seconds", "error", "endpoint_hint_count", "endpoint_hints",
+        ],
+    )
+    (OUTPUT / "endpoint_hints.json").write_text(
+        json.dumps(sorted(endpoint_hints), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (OUTPUT / "discovered_categories.json").write_text(
+        json.dumps(sorted(discovered_categories), ensure_ascii=False, indent=2), encoding="utf-8"
     )
     (OUTPUT / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
