@@ -26,8 +26,8 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check requests beautifulsoup4 lxml
-      - name: Run KKday research
-        run: python kkday_research/run.py
+      - name: Run KKday research batch B
+        run: python kkday_research/batch_b.py
       - name: Upload research output
         if: always()
         uses: actions/upload-artifact@v4
