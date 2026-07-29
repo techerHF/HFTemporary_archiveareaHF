@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check requests beautifulsoup4 lxml
       - name: Run city verification batch
-        run: python kkday_research/city_run.py
+        run: python kkday_research/city_run_fixed.py
       - name: Upload city research output
         if: always()
         uses: actions/upload-artifact@v4
